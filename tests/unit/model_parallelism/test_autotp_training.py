@@ -32,6 +32,65 @@ def reset_tp_model_init_state():
     set_autotp_mode(training=False)
 
 
+def _reset_tp_groups(monkeypatch):
+    monkeypatch.setattr(groups, "_DATA_PARALLEL_GROUP", None)
+    monkeypatch.setattr(groups, "_MODEL_PARALLEL_GROUP", None)
+    monkeypatch.setattr(groups, "_TENSOR_MODEL_PARALLEL_GROUP", None)
+
+
+def _patch_tp_group_creation(monkeypatch, *, rank=2, initialize_mesh_device=None):
+    new_group_calls = []
+
+    def fake_new_group(ranks):
+        ranks = tuple(ranks)
+        new_group_calls.append(ranks)
+        return ranks
+
+    _reset_tp_groups(monkeypatch)
+    monkeypatch.setattr(groups.dist, "get_world_size", lambda group=None: 4)
+    monkeypatch.setattr(groups.dist, "get_rank", lambda group=None: rank)
+    monkeypatch.setattr(groups.dist, "new_group", fake_new_group)
+    monkeypatch.setattr(groups, "log_dist", lambda *args, **kwargs: None)
+    if initialize_mesh_device is not None:
+        monkeypatch.setattr(groups.dist, "initialize_mesh_device", initialize_mesh_device)
+
+    return new_group_calls
+
+
+def test_init_tp_mesh_device_debug_detail_uses_explicit_groups(monkeypatch):
+
+    def fail_initialize_mesh_device(*args, **kwargs):
+        raise AssertionError("DeviceMesh should be skipped when TORCH_DISTRIBUTED_DEBUG=DETAIL")
+
+    new_group_calls = _patch_tp_group_creation(monkeypatch, initialize_mesh_device=fail_initialize_mesh_device)
+    monkeypatch.setenv("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
+
+    data_parallel_group, tensor_parallel_group = groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+
+    assert new_group_calls == [(0, 2), (1, 3), (0, 1), (2, 3)]
+    assert data_parallel_group == (0, 2)
+    assert tensor_parallel_group == (2, 3)
+    assert groups.get_data_parallel_group() == (0, 2)
+    assert groups.get_tensor_model_parallel_group() == (2, 3)
+
+
+def test_init_tp_mesh_device_split_error_falls_back_to_explicit_groups(monkeypatch):
+
+    def raise_split_error(*args, **kwargs):
+        raise RuntimeError(groups._DEVICE_MESH_SPLIT_UNSUPPORTED)
+
+    new_group_calls = _patch_tp_group_creation(monkeypatch, initialize_mesh_device=raise_split_error)
+    monkeypatch.delenv("TORCH_DISTRIBUTED_DEBUG", raising=False)
+
+    data_parallel_group, tensor_parallel_group = groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+
+    assert new_group_calls == [(0, 2), (1, 3), (0, 1), (2, 3)]
+    assert data_parallel_group == (0, 2)
+    assert tensor_parallel_group == (2, 3)
+    assert groups.get_data_parallel_group() == (0, 2)
+    assert groups.get_tensor_model_parallel_group() == (2, 3)
+
+
 class DummyMPU:
 
     def __init__(self, tp_world_size=1):
@@ -124,6 +183,58 @@ class TestTpParallelStates(DistributedTest):
         model, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
         assert groups.get_tensor_model_parallel_world_size() == tp_size
         assert groups.get_data_parallel_world_size() == dp_size
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+class TestAutoTpZeroStage3(DistributedTest):
+    """AutoTP + ZeRO stage 3 is supported only for ZeRO-Inference (no optimizer).
+
+    The training path (optimizer present) is blocked because TP-aware checkpoint
+    consolidation is not yet implemented; the inference path (no optimizer ->
+    DummyOptim -> DeepSpeedZeRoOffload) must initialize.
+    """
+
+    world_size = 4
+    reuse_dist_env = False
+
+    def _build_config(self, tp_size: int, with_optimizer: bool) -> dict:
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "tensor_parallel": {
+                "autotp_size": tp_size,
+                "partition_config": {
+                    "use_default_specs": False,
+                    "layer_specs": [{
+                        "patterns": [r".*\.weight$"],
+                        "partition_type": "column",
+                    }],
+                }
+            },
+            "zero_optimization": {
+                "stage": 3
+            }
+        }
+        if with_optimizer:
+            config_dict["optimizer"] = {"type": "Adam", "params": {"lr": 1e-6}}
+        if preferred_dtype() is torch.float16:
+            config_dict["fp16"] = {"enabled": True}
+        elif preferred_dtype() is torch.bfloat16:
+            config_dict["bf16"] = {"enabled": True}
+        return config_dict
+
+    def test_autotp_zero3_training_blocked(self, tp_size: int):
+        skip_on_device()
+        model = SimpleModel(hidden_dim=64)
+        config_dict = self._build_config(tp_size, with_optimizer=True)
+        with pytest.raises(NotImplementedError, match="only for inference"):
+            deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+
+    def test_autotp_zero3_inference(self, tp_size: int):
+        skip_on_device()
+        model = SimpleModel(hidden_dim=64)
+        config_dict = self._build_config(tp_size, with_optimizer=False)
+        model, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+        assert groups.get_tensor_model_parallel_world_size() == tp_size
 
 
 class TestTpModelInitCompatibility(DistributedTest):
